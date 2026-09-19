@@ -75,6 +75,16 @@ pub(crate) enum PosDelLoadAction {
     WaitFor(OwnedNotified),
 }
 
+/// Result of looking up the predicate for an equality delete file
+enum EqDelLookup {
+    /// The predicate is ready.
+    Loaded(Predicate),
+    /// The file is currently being loaded by another task. The future is
+    /// created under the state lock so it cannot miss the loader's
+    /// `notify_waiters()` (which stores no permit).
+    WaitFor(OwnedNotified),
+}
+
 impl DeleteFilter {
     /// Create a new DeleteFilter with the given runtime.
     pub(crate) fn new(runtime: Runtime) -> Self {
@@ -168,21 +178,25 @@ impl DeleteFilter {
         &self,
         file_path: &str,
     ) -> Option<Predicate> {
-        let notifier = {
-            match self.state.read().unwrap().equality_deletes.get(file_path) {
-                None => return None,
-                Some(EqDelState::Loading(notifier)) => notifier.clone(),
-                Some(EqDelState::Loaded(predicate)) => {
-                    return Some(predicate.clone());
-                }
-            }
+        let notified = match self.lookup_equality_delete(file_path)? {
+            EqDelLookup::Loaded(predicate) => return Some(predicate),
+            EqDelLookup::WaitFor(notified) => notified,
         };
 
-        notifier.notified().await;
+        notified.await;
 
         match self.state.read().unwrap().equality_deletes.get(file_path) {
             Some(EqDelState::Loaded(predicate)) => Some(predicate.clone()),
             _ => unreachable!("Cannot be any other state than loaded"),
+        }
+    }
+
+    fn lookup_equality_delete(&self, file_path: &str) -> Option<EqDelLookup> {
+        match self.state.read().unwrap().equality_deletes.get(file_path)? {
+            EqDelState::Loading(notify) => {
+                Some(EqDelLookup::WaitFor(notify.clone().notified_owned()))
+            }
+            EqDelState::Loaded(predicate) => Some(EqDelLookup::Loaded(predicate.clone())),
         }
     }
 
@@ -338,6 +352,39 @@ pub(crate) mod tests {
         assert!(
             waited.is_ok(),
             "WaitFor future must resolve after finish_pos_del_load"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_eq_del_wait_for_completes_when_load_finishes_before_await() {
+        let filter = DeleteFilter::new(Runtime::current());
+        let path = "s3://bucket/eq-delete.parquet";
+
+        let notify = filter.try_start_eq_del_load(path).unwrap();
+
+        let Some(EqDelLookup::WaitFor(notified)) = filter.lookup_equality_delete(path) else {
+            panic!("expected WaitFor for an in-progress load");
+        };
+
+        // Loader completes and signals before the waiter awaits.
+        filter
+            .state
+            .write()
+            .unwrap()
+            .equality_deletes
+            .insert(path.to_string(), EqDelState::Loaded(AlwaysTrue));
+        notify.notify_waiters();
+
+        let waited = tokio::time::timeout(std::time::Duration::from_secs(5), notified).await;
+        assert!(
+            waited.is_ok(),
+            "WaitFor future must resolve after the load finishes"
+        );
+        assert_eq!(
+            filter
+                .get_equality_delete_predicate_for_delete_file_path(path)
+                .await,
+            Some(AlwaysTrue)
         );
     }
 
