@@ -1276,4 +1276,146 @@ mod tests {
             "positional deletes must be applied correctly even when page indexes are absent"
         );
     }
+
+    const EQ_DEL_ROWS: [(&str, &str, &str); 5] = [
+        ("e1", "t1", "v1"),
+        ("e1", "t2", "v2"),
+        ("e2", "t1", "v3"),
+        ("e2", "t2", "v4"),
+        ("e1", "t3", "v5"),
+    ];
+
+    fn eq_del_table_schema() -> SchemaRef {
+        Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::optional(1, "entity_id", Type::Primitive(PrimitiveType::String))
+                        .into(),
+                    NestedField::optional(2, "ts", Type::Primitive(PrimitiveType::String)).into(),
+                    NestedField::optional(3, "v", Type::Primitive(PrimitiveType::String)).into(),
+                ])
+                .build()
+                .unwrap(),
+        )
+    }
+
+    fn string_field(name: &str, id: i32) -> Field {
+        Field::new(name, DataType::Utf8, true).with_metadata(HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            id.to_string(),
+        )]))
+    }
+
+    fn write_strings(path: &str, fields: Vec<Field>, columns: Vec<Vec<Option<&str>>>) {
+        let columns = columns
+            .into_iter()
+            .map(|c| Arc::new(StringArray::from(c)) as ArrayRef)
+            .collect();
+        let batch = RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), columns).unwrap();
+        let mut writer =
+            ArrowWriter::try_new(File::create(path).unwrap(), batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+
+    /// Reads `EQ_DEL_ROWS` under equality deletes on `(entity_id, ts)` and
+    /// returns the `v` column of what is left.
+    async fn read_under_equality_deletes(
+        deleted_keys: Vec<(Option<&str>, Option<&str>)>,
+        predicate: Option<Predicate>,
+    ) -> Vec<String> {
+        let tmp_dir = TempDir::new().unwrap();
+        let dir = tmp_dir.path().to_str().unwrap();
+        let schema = eq_del_table_schema();
+
+        let data_path = format!("{dir}/data.parquet");
+        write_strings(
+            &data_path,
+            vec![
+                string_field("entity_id", 1),
+                string_field("ts", 2),
+                string_field("v", 3),
+            ],
+            vec![
+                EQ_DEL_ROWS.iter().map(|r| Some(r.0)).collect(),
+                EQ_DEL_ROWS.iter().map(|r| Some(r.1)).collect(),
+                EQ_DEL_ROWS.iter().map(|r| Some(r.2)).collect(),
+            ],
+        );
+        let delete_path = format!("{dir}/eq-deletes.parquet");
+        write_strings(
+            &delete_path,
+            vec![string_field("entity_id", 1), string_field("ts", 2)],
+            vec![
+                deleted_keys.iter().map(|k| k.0).collect(),
+                deleted_keys.iter().map(|k| k.1).collect(),
+            ],
+        );
+
+        let eq_del = FileScanTaskDeleteFile::builder()
+            .with_file_path(delete_path.clone())
+            .with_file_size_in_bytes(std::fs::metadata(&delete_path).unwrap().len())
+            .with_file_type(DataContentType::EqualityDeletes)
+            .with_partition_spec_id(0)
+            .with_equality_ids(Some(vec![1, 2]))
+            .build();
+        let task = FileScanTask::builder()
+            .with_file_size_in_bytes(std::fs::metadata(&data_path).unwrap().len())
+            .with_start(0)
+            .with_length(0)
+            .with_data_file_path(data_path)
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(schema.clone())
+            .with_project_field_ids(vec![3])
+            .with_predicate(predicate.map(|p| p.bind(schema, true).unwrap()))
+            .with_deletes(vec![eq_del])
+            .with_case_sensitive(true)
+            .build();
+
+        let reader = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current()).build();
+        let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
+        let batches = reader
+            .read(tasks)
+            .unwrap()
+            .stream()
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .unwrap();
+        batches
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_string::<i32>()
+                    .iter()
+                    .map(|v| v.unwrap().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn equality_deletes_remove_matching_rows_from_a_filtered_read() {
+        // Deletes for one row the scan selects, one it does not, and one key
+        // the file does not hold.
+        let deleted = vec![
+            (Some("e1"), Some("t2")),
+            (Some("e2"), Some("t1")),
+            (Some("e9"), Some("t9")),
+        ];
+        let predicate = Reference::new("entity_id").equal_to(Datum::string("e1"));
+
+        let left = read_under_equality_deletes(deleted, Some(predicate)).await;
+
+        assert_eq!(left, vec!["v1", "v5"]);
+    }
+
+    #[tokio::test]
+    async fn equality_deletes_remove_matching_rows_from_an_unfiltered_read() {
+        let deleted = vec![(Some("e1"), Some("t2")), (Some("e2"), Some("t1"))];
+
+        let left = read_under_equality_deletes(deleted, None).await;
+
+        assert_eq!(left, vec!["v1", "v4", "v5"]);
+    }
 }
