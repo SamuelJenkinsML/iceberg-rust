@@ -24,9 +24,12 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
 use futures::{StreamExt, TryStreamExt};
-use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
+use parquet::arrow::arrow_reader::{
+    ArrowPredicate, ArrowReaderMetadata, ArrowReaderOptions, RowFilter,
+};
 use parquet::arrow::{PARQUET_FIELD_ID_META_KEY, ParquetRecordBatchStreamBuilder};
 
+use super::row_filter::CountingPredicate;
 use super::{
     ArrowFileReader, ArrowReader, ParquetReadOptions, add_fallback_field_ids_to_arrow_schema,
     apply_name_mapping_to_arrow_schema,
@@ -264,25 +267,20 @@ impl FileScanTaskReader {
         let delete_filter = delete_filter_rx.await.unwrap()?;
         let delete_predicate = delete_filter.build_equality_delete_predicate(&task).await?;
 
-        // In addition to the optional predicate supplied in the `FileScanTask`,
-        // we also have an optional predicate resulting from equality delete files.
-        // If both are present, we logical-AND them together to form a single filter
-        // predicate that we can pass to the `RecordBatchStreamBuilder`.
-        let final_predicate = match (&task.predicate, delete_predicate) {
-            (None, None) => None,
-            (Some(predicate), None) => Some(predicate.clone()),
-            (None, Some(ref predicate)) => Some(predicate.clone()),
-            (Some(filter_predicate), Some(delete_predicate)) => {
-                Some(filter_predicate.clone().and(delete_predicate))
-            }
-        };
+        // The scan predicate and the equality deletes are separate stages of the
+        // row filter, scan first. Parquet hands a stage only the rows the stage
+        // before it kept, so the deletes are tested against the rows the scan
+        // selects rather than against every row of the file. ANDed into one
+        // predicate, every delete term ran over every row.
+        let mut filter_stages: Vec<Box<dyn ArrowPredicate>> = Vec::new();
 
-        // There are three possible sources for potential lists of selected RowGroup indices,
+        // There are two possible sources for potential lists of selected RowGroup indices,
         // and two for `RowSelection`s.
-        // Selected RowGroup index lists can come from three sources:
+        // Selected RowGroup index lists can come from two sources:
         //   * When task.start and task.length specify a byte range (file splitting);
-        //   * When there are equality delete files that are applicable;
         //   * When there is a scan predicate and row_group_filtering_enabled = true.
+        // Equality deletes prune nothing: a row group whose every row is deleted
+        // is rare, and looking for one walks every delete term per row group.
         // `RowSelection`s can be created in either or both of the following cases:
         //   * When there are positional delete files that are applicable;
         //   * When there is a scan predicate and row_selection_enabled = true
@@ -306,25 +304,24 @@ impl FileScanTaskReader {
             selected_row_group_indices = Some(byte_range_filtered_row_groups);
         }
 
-        if let Some(predicate) = final_predicate {
+        if let Some(predicate) = &task.predicate {
             let (iceberg_field_ids, field_id_map) = ArrowReader::build_field_id_set_and_map(
                 record_batch_stream_builder.parquet_schema(),
                 record_batch_stream_builder.schema(),
-                &predicate,
+                predicate,
                 use_position_fallback,
             )?;
 
-            let row_filter = ArrowReader::get_row_filter(
-                &predicate,
+            filter_stages.push(ArrowReader::get_arrow_predicate(
+                predicate,
                 record_batch_stream_builder.parquet_schema(),
                 &iceberg_field_ids,
                 &field_id_map,
-            )?;
-            record_batch_stream_builder = record_batch_stream_builder.with_row_filter(row_filter);
+            )?);
 
             if self.row_group_filtering_enabled {
                 let predicate_filtered_row_groups = ArrowReader::get_selected_row_group_indices(
-                    &predicate,
+                    predicate,
                     record_batch_stream_builder.metadata(),
                     &field_id_map,
                     &task.schema,
@@ -347,13 +344,37 @@ impl FileScanTaskReader {
 
             if self.row_selection_enabled {
                 row_selection = ArrowReader::get_row_selection_for_filter_predicate(
-                    &predicate,
+                    predicate,
                     record_batch_stream_builder.metadata(),
                     &selected_row_group_indices,
                     &field_id_map,
                     &task.schema,
                 )?;
             }
+        }
+
+        if let Some(delete_predicate) = &delete_predicate {
+            let (iceberg_field_ids, field_id_map) = ArrowReader::build_field_id_set_and_map(
+                record_batch_stream_builder.parquet_schema(),
+                record_batch_stream_builder.schema(),
+                delete_predicate,
+                use_position_fallback,
+            )?;
+            let stage = ArrowReader::get_arrow_predicate(
+                delete_predicate,
+                record_batch_stream_builder.parquet_schema(),
+                &iceberg_field_ids,
+                &field_id_map,
+            )?;
+            filter_stages.push(Box::new(CountingPredicate::new(
+                stage,
+                Arc::clone(self.scan_metrics.equality_delete_rows_checked_counter()),
+            )));
+        }
+
+        if !filter_stages.is_empty() {
+            record_batch_stream_builder =
+                record_batch_stream_builder.with_row_filter(RowFilter::new(filter_stages));
         }
 
         let positional_delete_indexes = delete_filter.get_delete_vector(&task);

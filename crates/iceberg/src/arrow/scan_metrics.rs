@@ -53,13 +53,25 @@ impl<F: FileRead> FileRead for CountingFileRead<F> {
 #[derive(Clone, Debug)]
 pub struct ScanMetrics {
     bytes_read: Arc<AtomicU64>,
+    equality_delete_rows_checked: Arc<AtomicU64>,
 }
 
 impl ScanMetrics {
     pub(crate) fn new() -> Self {
         Self {
             bytes_read: Arc::new(AtomicU64::new(0)),
+            equality_delete_rows_checked: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    pub(crate) fn equality_delete_rows_checked_counter(&self) -> &Arc<AtomicU64> {
+        &self.equality_delete_rows_checked
+    }
+
+    /// Data rows tested against equality deletes during this scan. Rows the
+    /// scan predicate rejected are not tested and are not counted.
+    pub fn equality_delete_rows_checked(&self) -> u64 {
+        self.equality_delete_rows_checked.load(Ordering::Relaxed)
     }
 
     pub(crate) fn bytes_read_counter(&self) -> &Arc<AtomicU64> {

@@ -22,9 +22,12 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
+use arrow_array::{BooleanArray, RecordBatch};
+use arrow_schema::ArrowError;
 use parquet::arrow::ProjectionMask;
-use parquet::arrow::arrow_reader::{ArrowPredicateFn, RowFilter, RowSelection};
+use parquet::arrow::arrow_reader::{ArrowPredicate, ArrowPredicateFn, RowSelection};
 use parquet::file::metadata::ParquetMetaData;
 use parquet::schema::types::SchemaDescriptor;
 
@@ -36,13 +39,38 @@ use crate::expr::visitors::page_index_evaluator::PageIndexEvaluator;
 use crate::expr::visitors::row_group_metrics_evaluator::RowGroupMetricsEvaluator;
 use crate::spec::Schema;
 
+/// Counts the rows a row-filter stage is asked to judge.
+pub(super) struct CountingPredicate {
+    inner: Box<dyn ArrowPredicate>,
+    rows: Arc<AtomicU64>,
+}
+
+impl CountingPredicate {
+    pub(super) fn new(inner: Box<dyn ArrowPredicate>, rows: Arc<AtomicU64>) -> Self {
+        Self { inner, rows }
+    }
+}
+
+impl ArrowPredicate for CountingPredicate {
+    fn projection(&self) -> &ProjectionMask {
+        self.inner.projection()
+    }
+
+    fn evaluate(&mut self, batch: RecordBatch) -> std::result::Result<BooleanArray, ArrowError> {
+        self.rows
+            .fetch_add(batch.num_rows() as u64, Ordering::Relaxed);
+        self.inner.evaluate(batch)
+    }
+}
+
 impl ArrowReader {
-    pub(super) fn get_row_filter(
+    /// One stage of a `RowFilter`.
+    pub(super) fn get_arrow_predicate(
         predicates: &BoundPredicate,
         parquet_schema: &SchemaDescriptor,
         iceberg_field_ids: &HashSet<i32>,
         field_id_map: &HashMap<i32, usize>,
-    ) -> Result<RowFilter> {
+    ) -> Result<Box<dyn ArrowPredicate>> {
         // Collect Parquet column indices from field ids.
         // If the field id is not found in Parquet schema, it will be ignored due to schema evolution.
         let mut column_indices = iceberg_field_ids
@@ -62,8 +90,10 @@ impl ArrowReader {
         // creates the projection mask for the Arrow predicates.
         let projection_mask = ProjectionMask::leaves(parquet_schema, column_indices.clone());
         let predicate_func = visit(&mut converter, predicates)?;
-        let arrow_predicate = ArrowPredicateFn::new(projection_mask, predicate_func);
-        Ok(RowFilter::new(vec![Box::new(arrow_predicate)]))
+        Ok(Box::new(ArrowPredicateFn::new(
+            projection_mask,
+            predicate_func,
+        )))
     }
 
     pub(super) fn get_selected_row_group_indices(
@@ -1319,12 +1349,13 @@ mod tests {
         writer.close().unwrap();
     }
 
-    /// Reads `EQ_DEL_ROWS` under equality deletes on `(entity_id, ts)` and
-    /// returns the `v` column of what is left.
+    /// Reads `EQ_DEL_ROWS` under equality deletes on `(entity_id, ts)`.
+    /// Returns the `v` column of what is left, and how many rows were tested
+    /// against the deletes.
     async fn read_under_equality_deletes(
         deleted_keys: Vec<(Option<&str>, Option<&str>)>,
         predicate: Option<Predicate>,
-    ) -> Vec<String> {
+    ) -> (Vec<String>, u64) {
         let tmp_dir = TempDir::new().unwrap();
         let dir = tmp_dir.path().to_str().unwrap();
         let schema = eq_del_table_schema();
@@ -1375,14 +1406,14 @@ mod tests {
 
         let reader = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current()).build();
         let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
-        let batches = reader
-            .read(tasks)
-            .unwrap()
+        let result = reader.read(tasks).unwrap();
+        let metrics = result.metrics().clone();
+        let batches = result
             .stream()
             .try_collect::<Vec<RecordBatch>>()
             .await
             .unwrap();
-        batches
+        let left = batches
             .iter()
             .flat_map(|b| {
                 b.column(0)
@@ -1391,7 +1422,8 @@ mod tests {
                     .map(|v| v.unwrap().to_string())
                     .collect::<Vec<_>>()
             })
-            .collect()
+            .collect();
+        (left, metrics.equality_delete_rows_checked())
     }
 
     #[tokio::test]
@@ -1405,17 +1437,20 @@ mod tests {
         ];
         let predicate = Reference::new("entity_id").equal_to(Datum::string("e1"));
 
-        let left = read_under_equality_deletes(deleted, Some(predicate)).await;
+        let (left, checked) = read_under_equality_deletes(deleted, Some(predicate)).await;
 
         assert_eq!(left, vec!["v1", "v5"]);
+        // Three of the five rows are e1. The other two never reach the deletes.
+        assert_eq!(checked, 3);
     }
 
     #[tokio::test]
     async fn equality_deletes_remove_matching_rows_from_an_unfiltered_read() {
         let deleted = vec![(Some("e1"), Some("t2")), (Some("e2"), Some("t1"))];
 
-        let left = read_under_equality_deletes(deleted, None).await;
+        let (left, checked) = read_under_equality_deletes(deleted, None).await;
 
         assert_eq!(left, vec!["v1", "v4", "v5"]);
+        assert_eq!(checked, 5);
     }
 }
