@@ -29,12 +29,12 @@ use parquet::arrow::arrow_reader::{
 };
 use parquet::arrow::{PARQUET_FIELD_ID_META_KEY, ParquetRecordBatchStreamBuilder};
 
-use super::row_filter::CountingPredicate;
 use super::{
     ArrowFileReader, ArrowReader, ParquetReadOptions, add_fallback_field_ids_to_arrow_schema,
     apply_name_mapping_to_arrow_schema,
 };
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
+use crate::arrow::equality_delete_set::EqualityDeletePredicate;
 use crate::arrow::int96::coerce_int96_timestamps;
 use crate::arrow::record_batch_transformer::RecordBatchTransformerBuilder;
 use crate::arrow::scan_metrics::{CountingFileRead, ScanMetrics, ScanResult};
@@ -265,13 +265,12 @@ impl FileScanTaskReader {
         }
 
         let delete_filter = delete_filter_rx.await.unwrap()?;
-        let delete_predicate = delete_filter.build_equality_delete_predicate(&task).await?;
+        let equality_deletes = delete_filter.equality_delete_sets(&task).await?;
 
         // The scan predicate and the equality deletes are separate stages of the
         // row filter, scan first. Parquet hands a stage only the rows the stage
         // before it kept, so the deletes are tested against the rows the scan
-        // selects rather than against every row of the file. ANDed into one
-        // predicate, every delete term ran over every row.
+        // selects rather than against every row of the file.
         let mut filter_stages: Vec<Box<dyn ArrowPredicate>> = Vec::new();
 
         // There are two possible sources for potential lists of selected RowGroup indices,
@@ -353,23 +352,18 @@ impl FileScanTaskReader {
             }
         }
 
-        if let Some(delete_predicate) = &delete_predicate {
-            let (iceberg_field_ids, field_id_map) = ArrowReader::build_field_id_set_and_map(
+        if !equality_deletes.is_empty() {
+            let field_id_map = ArrowReader::build_field_id_map_for_file(
                 record_batch_stream_builder.parquet_schema(),
                 record_batch_stream_builder.schema(),
-                delete_predicate,
                 use_position_fallback,
             )?;
-            let stage = ArrowReader::get_arrow_predicate(
-                delete_predicate,
+            filter_stages.push(Box::new(EqualityDeletePredicate::try_new(
+                equality_deletes,
                 record_batch_stream_builder.parquet_schema(),
-                &iceberg_field_ids,
                 &field_id_map,
-            )?;
-            filter_stages.push(Box::new(CountingPredicate::new(
-                stage,
                 Arc::clone(self.scan_metrics.equality_delete_rows_checked_counter()),
-            )));
+            )?));
         }
 
         if !filter_stages.is_empty() {

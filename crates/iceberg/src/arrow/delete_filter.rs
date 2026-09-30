@@ -22,9 +22,8 @@ use tokio::sync::Notify;
 use tokio::sync::futures::OwnedNotified;
 use tokio::sync::oneshot::Receiver;
 
+use crate::arrow::equality_delete_set::EqualityDeleteSet;
 use crate::delete_vector::DeleteVector;
-use crate::expr::Predicate::AlwaysTrue;
-use crate::expr::{Bind, BoundPredicate, Predicate};
 use crate::runtime::Runtime;
 use crate::scan::{FileScanTask, FileScanTaskDeleteFile};
 use crate::spec::DataContentType;
@@ -33,7 +32,7 @@ use crate::{Error, ErrorKind, Result};
 #[derive(Debug)]
 enum EqDelState {
     Loading(Arc<Notify>),
-    Loaded(Predicate),
+    Loaded(Arc<EqualityDeleteSet>),
 }
 
 /// State tracking for positional delete files.
@@ -75,10 +74,10 @@ pub(crate) enum PosDelLoadAction {
     WaitFor(OwnedNotified),
 }
 
-/// Result of looking up the predicate for an equality delete file
+/// Result of looking up the deleted keys of an equality delete file
 enum EqDelLookup {
-    /// The predicate is ready.
-    Loaded(Predicate),
+    /// The keys are ready.
+    Loaded(Arc<EqualityDeleteSet>),
     /// The file is currently being loaded by another task. The future is
     /// created under the state lock so it cannot miss the loader's
     /// `notify_waiters()` (which stores no permit).
@@ -173,20 +172,20 @@ impl DeleteFilter {
         }
     }
 
-    /// Retrieve the equality delete predicate for a given eq delete file path
-    pub(crate) async fn get_equality_delete_predicate_for_delete_file_path(
+    /// Retrieve the deleted keys of a given eq delete file path
+    pub(crate) async fn get_equality_delete_set_for_delete_file_path(
         &self,
         file_path: &str,
-    ) -> Option<Predicate> {
+    ) -> Option<Arc<EqualityDeleteSet>> {
         let notified = match self.lookup_equality_delete(file_path)? {
-            EqDelLookup::Loaded(predicate) => return Some(predicate),
+            EqDelLookup::Loaded(set) => return Some(set),
             EqDelLookup::WaitFor(notified) => notified,
         };
 
         notified.await;
 
         match self.state.read().unwrap().equality_deletes.get(file_path) {
-            Some(EqDelState::Loaded(predicate)) => Some(predicate.clone()),
+            Some(EqDelState::Loaded(set)) => Some(Arc::clone(set)),
             _ => unreachable!("Cannot be any other state than loaded"),
         }
     }
@@ -196,49 +195,40 @@ impl DeleteFilter {
             EqDelState::Loading(notify) => {
                 Some(EqDelLookup::WaitFor(notify.clone().notified_owned()))
             }
-            EqDelState::Loaded(predicate) => Some(EqDelLookup::Loaded(predicate.clone())),
+            EqDelState::Loaded(set) => Some(EqDelLookup::Loaded(Arc::clone(set))),
         }
     }
 
-    /// Builds eq delete predicate for the provided task.
-    pub(crate) async fn build_equality_delete_predicate(
+    /// The key sets of the equality delete files that apply to the task.
+    /// A file that names no key is left out.
+    pub(crate) async fn equality_delete_sets(
         &self,
         file_scan_task: &FileScanTask,
-    ) -> Result<Option<BoundPredicate>> {
-        // * Filter the task's deletes into just the Equality deletes
-        // * Retrieve the unbound predicate for each from self.state.equality_deletes
-        // * Logical-AND them all together to get a single combined `Predicate`
-        // * Bind the predicate to the task's schema to get a `BoundPredicate`
-
-        let mut combined_predicate = AlwaysTrue;
+    ) -> Result<Vec<Arc<EqualityDeleteSet>>> {
+        let mut sets = Vec::new();
         for delete in &file_scan_task.deletes {
             if !is_equality_delete(delete) {
                 continue;
             }
 
-            let Some(predicate) = self
-                .get_equality_delete_predicate_for_delete_file_path(&delete.file_path)
+            let Some(set) = self
+                .get_equality_delete_set_for_delete_file_path(&delete.file_path)
                 .await
             else {
                 return Err(Error::new(
                     ErrorKind::Unexpected,
                     format!(
-                        "Missing predicate for equality delete file '{}'",
+                        "Missing keys for equality delete file '{}'",
                         delete.file_path
                     ),
                 ));
             };
 
-            combined_predicate = combined_predicate.and(predicate);
+            if !set.is_empty() {
+                sets.push(set);
+            }
         }
-
-        if combined_predicate == AlwaysTrue {
-            return Ok(None);
-        }
-
-        let bound_predicate = combined_predicate
-            .bind(file_scan_task.schema.clone(), file_scan_task.case_sensitive)?;
-        Ok(Some(bound_predicate))
+        Ok(sets)
     }
 
     pub(crate) fn upsert_delete_vector(
@@ -261,7 +251,7 @@ impl DeleteFilter {
     pub(crate) fn insert_equality_delete(
         &self,
         delete_file_path: &str,
-        eq_del: Receiver<Predicate>,
+        eq_del: Receiver<EqualityDeleteSet>,
     ) {
         let notify = {
             let mut state = self.state.write().unwrap();
@@ -286,7 +276,7 @@ impl DeleteFilter {
                 let mut state = state.write().unwrap();
                 state
                     .equality_deletes
-                    .insert(delete_file_path, EqDelState::Loaded(eq_del));
+                    .insert(delete_file_path, EqDelState::Loaded(Arc::new(eq_del)));
             }
             notify.notify_waiters();
         });
@@ -314,9 +304,8 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
-    use crate::expr::Reference;
     use crate::io::FileIO;
-    use crate::spec::{DataFileFormat, Datum, NestedField, PrimitiveType, Schema, Type};
+    use crate::spec::{DataFileFormat, Schema};
 
     type ArrowSchemaRef = Arc<ArrowSchema>;
 
@@ -372,7 +361,10 @@ pub(crate) mod tests {
             .write()
             .unwrap()
             .equality_deletes
-            .insert(path.to_string(), EqDelState::Loaded(AlwaysTrue));
+            .insert(
+                path.to_string(),
+                EqDelState::Loaded(Arc::new(EqualityDeleteSet::empty())),
+            );
         notify.notify_waiters();
 
         let waited = tokio::time::timeout(std::time::Duration::from_secs(5), notified).await;
@@ -380,11 +372,11 @@ pub(crate) mod tests {
             waited.is_ok(),
             "WaitFor future must resolve after the load finishes"
         );
-        assert_eq!(
+        assert!(
             filter
-                .get_equality_delete_predicate_for_delete_file_path(path)
-                .await,
-            Some(AlwaysTrue)
+                .get_equality_delete_set_for_delete_file_path(path)
+                .await
+                .is_some()
         );
     }
 
@@ -573,77 +565,25 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn test_build_equality_delete_predicate_case_sensitive() {
-        let schema = Arc::new(
-            Schema::builder()
-                .with_schema_id(1)
-                .with_fields(vec![
-                    NestedField::required(1, "Id", Type::Primitive(PrimitiveType::Long)).into(),
-                ])
-                .build()
-                .unwrap(),
-        );
-
-        // ---------- fake FileScanTask ----------
-        let task = FileScanTask::builder()
-            .with_file_size_in_bytes(0)
-            .with_start(0)
-            .with_length(0)
-            .with_data_file_path("data.parquet".to_string())
-            .with_data_file_format(crate::spec::DataFileFormat::Parquet)
-            .with_schema(schema.clone())
-            .with_project_field_ids(vec![])
-            .with_deletes(vec![
-                FileScanTaskDeleteFile::builder()
-                    .with_file_path("eq-del.parquet".to_string())
-                    .with_file_size_in_bytes(1) // never read; this test fails before opening the file
-                    .with_file_type(DataContentType::EqualityDeletes)
-                    .with_partition_spec_id(0)
-                    .build(),
-            ])
-            .with_case_sensitive(true)
-            .build();
-
-        let filter = DeleteFilter::new(Runtime::current());
-
-        // ---------- insert equality delete predicate ----------
-        let pred = Reference::new("id").equal_to(Datum::long(10));
-
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        filter.insert_equality_delete("eq-del.parquet", rx);
-
-        tx.send(pred).unwrap();
-
-        // ---------- should FAIL ----------
-        let result = filter.build_equality_delete_predicate(&task).await;
-
-        assert!(
-            result.is_err(),
-            "case_sensitive=true should fail when column case mismatches"
-        );
-    }
-
-    #[tokio::test]
     async fn test_equality_delete_waiter_is_notified_after_load_started() {
         let filter = DeleteFilter::new(Runtime::current());
         let delete_file_path = "eq-del.parquet";
 
         assert!(filter.try_start_eq_del_load(delete_file_path).is_some());
 
-        let waiter = filter.get_equality_delete_predicate_for_delete_file_path(delete_file_path);
+        let waiter = filter.get_equality_delete_set_for_delete_file_path(delete_file_path);
         tokio::pin!(waiter);
         assert!(matches!(futures::poll!(&mut waiter), Poll::Pending));
 
         let (tx, rx) = tokio::sync::oneshot::channel();
         filter.insert_equality_delete(delete_file_path, rx);
-        tx.send(Reference::new("id").equal_to(Datum::long(10)))
-            .unwrap();
+        tx.send(EqualityDeleteSet::empty()).unwrap();
 
-        let predicate = tokio::time::timeout(Duration::from_secs(1), waiter)
+        let loaded = tokio::time::timeout(Duration::from_secs(1), waiter)
             .await
             .expect("equality delete waiter should be notified")
-            .expect("equality delete predicate should be loaded");
+            .expect("equality delete keys should be loaded");
 
-        assert_eq!(predicate.to_string(), "id = 10");
+        assert!(loaded.is_empty());
     }
 }

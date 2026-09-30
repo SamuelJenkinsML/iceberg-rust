@@ -16,28 +16,20 @@
 // under the License.
 
 use std::collections::{HashMap, HashSet};
-use std::ops::Not;
-use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef, Int64Array, StringArray, StructArray};
+use arrow_array::{Int64Array, StringArray};
 use futures::{StreamExt, TryStreamExt};
 use tokio::sync::oneshot::{Receiver, channel};
 
 use super::delete_filter::{DeleteFilter, PosDelLoadAction};
 use crate::arrow::delete_file_loader::BasicDeleteFileLoader;
+use crate::arrow::equality_delete_set::EqualityDeleteSet;
 use crate::arrow::scan_metrics::ScanMetrics;
-use crate::arrow::{arrow_primitive_to_literal, arrow_schema_to_schema};
 use crate::delete_vector::DeleteVector;
-use crate::expr::Predicate::AlwaysTrue;
-use crate::expr::{Predicate, Reference};
 use crate::io::FileIO;
 use crate::runtime::Runtime;
 use crate::scan::{ArrowRecordBatchStream, FileScanTaskDeleteFile};
-use crate::spec::{
-    DataContentType, Datum, ListType, MapType, NestedField, NestedFieldRef, PartnerAccessor,
-    PrimitiveType, Schema, SchemaRef, SchemaWithPartnerVisitor, StructType, Type,
-    visit_schema_with_partner,
-};
+use crate::spec::{DataContentType, SchemaRef};
 use crate::{Error, ErrorKind, Result};
 
 #[derive(Clone, Debug)]
@@ -62,7 +54,7 @@ enum DeleteFileContext {
     FreshEqDel {
         batch_stream: ArrowRecordBatchStream,
         equality_ids: HashSet<i32>,
-        sender: tokio::sync::oneshot::Sender<Predicate>,
+        sender: tokio::sync::oneshot::Sender<EqualityDeleteSet>,
     },
 }
 
@@ -116,15 +108,15 @@ impl CachingDeleteFileLoader {
     ///    another concurrently processing data file scan task. If it is, we skip it.
     ///    If not, the DeleteFilter is updated to contain a notifier to prevent other data file
     ///    tasks from starting to load the same equality delete file. We spawn a task to load
-    ///    the EQ delete's record batch stream, convert it to a predicate, update the delete filter,
+    ///    the EQ delete's record batch stream, convert it to a set of deleted keys, update the delete filter,
     ///    and notify any task that was waiting for it.
     ///  * When this gets updated to add support for delete vectors, the load phase will return
     ///    a PuffinReader for them.
     ///  * The parse phase parses each record batch stream according to its associated data type.
     ///    The result of this is a map of data file paths to delete vectors for the positional
     ///    delete tasks (and in future for the delete vector tasks). For equality delete
-    ///    file tasks, this results in an unbound Predicate.
-    ///  * The unbound Predicates resulting from equality deletes are sent to their associated oneshot
+    ///    file tasks, this results in an `EqualityDeleteSet`.
+    ///  * The key sets resulting from equality deletes are sent to their associated oneshot
     ///    channel to store them in the right place in the delete file managers state.
     ///  * The results of all of these futures are awaited on in parallel with the specified
     ///    level of concurrency and collected into a vec. We then combine all the delete
@@ -147,7 +139,7 @@ impl CachingDeleteFileLoader {
     ///                     Pos Del           Del Vec (Not yet Implemented)         EQ Del
     ///                       |                             |                          |
     ///              [parse pos del stream]         [parse del vec puffin]       [parse eq del]
-    ///          HashMap<String, RoaringTreeMap> HashMap<String, RoaringTreeMap>   (Predicate, Sender)
+    ///          HashMap<String, RoaringTreeMap> HashMap<String, RoaringTreeMap>   (EqualityDeleteSet, Sender)
     ///                       |                             |                          |
     ///                       |                             |                 [persist to state]
     ///                       |                             |                          ()
@@ -310,16 +302,16 @@ impl CachingDeleteFileLoader {
                 batch_stream,
                 equality_ids,
             } => {
-                let predicate =
+                let deleted_keys =
                     Self::parse_equality_deletes_record_batch_stream(batch_stream, equality_ids)
                         .await?;
 
                 sender
-                    .send(predicate)
+                    .send(deleted_keys)
                     .map_err(|err| {
                         Error::new(
                             ErrorKind::Unexpected,
-                            "Could not send eq delete predicate to state",
+                            "Could not send eq delete keys to state",
                         )
                     })
                     .map(|_| ParsedDeleteFileContext::EqDel)
@@ -380,229 +372,12 @@ impl CachingDeleteFileLoader {
     async fn parse_equality_deletes_record_batch_stream(
         mut stream: ArrowRecordBatchStream,
         equality_ids: HashSet<i32>,
-    ) -> Result<Predicate> {
-        let mut row_predicates = Vec::new();
-        let mut batch_schema_iceberg: Option<Schema> = None;
-        let accessor = EqDelRecordBatchPartnerAccessor;
-
+    ) -> Result<EqualityDeleteSet> {
+        let mut set = EqualityDeleteSet::empty();
         while let Some(record_batch) = stream.next().await {
-            let record_batch = record_batch?;
-
-            if record_batch.num_columns() == 0 {
-                return Ok(AlwaysTrue);
-            }
-
-            let schema = match &batch_schema_iceberg {
-                Some(schema) => schema,
-                None => {
-                    let schema = arrow_schema_to_schema(record_batch.schema().as_ref())?;
-                    batch_schema_iceberg = Some(schema);
-                    batch_schema_iceberg.as_ref().unwrap()
-                }
-            };
-
-            let root_array: ArrayRef = Arc::new(StructArray::from(record_batch));
-
-            let mut processor = EqDelColumnProcessor::new(&equality_ids);
-            visit_schema_with_partner(schema, &root_array, &mut processor, &accessor)?;
-
-            let mut datum_columns_with_names = processor.finish()?;
-            if datum_columns_with_names.is_empty() {
-                continue;
-            }
-
-            // Process the collected columns in lockstep
-            #[allow(clippy::len_zero)]
-            while datum_columns_with_names[0].0.len() > 0 {
-                let mut row_predicate = AlwaysTrue;
-                for &mut (ref mut column, ref field_name) in &mut datum_columns_with_names {
-                    if let Some(item) = column.next() {
-                        let cell_predicate = if let Some(datum) = item? {
-                            Reference::new(field_name.clone()).equal_to(datum.clone())
-                        } else {
-                            Reference::new(field_name.clone()).is_null()
-                        };
-                        row_predicate = row_predicate.and(cell_predicate)
-                    }
-                }
-                row_predicates.push(row_predicate.not().rewrite_not());
-            }
+            set.insert_batch(&record_batch?, &equality_ids)?;
         }
-
-        // All row predicates are combined to a single predicate by creating a balanced binary tree.
-        // Using a simple fold would result in a deeply nested predicate that can cause a stack overflow.
-        while row_predicates.len() > 1 {
-            let mut next_level = Vec::with_capacity(row_predicates.len().div_ceil(2));
-            let mut iter = row_predicates.into_iter();
-            while let Some(p1) = iter.next() {
-                if let Some(p2) = iter.next() {
-                    next_level.push(p1.and(p2));
-                } else {
-                    next_level.push(p1);
-                }
-            }
-            row_predicates = next_level;
-        }
-
-        match row_predicates.pop() {
-            Some(p) => Ok(p),
-            None => Ok(AlwaysTrue),
-        }
-    }
-}
-
-struct EqDelColumnProcessor<'a> {
-    equality_ids: &'a HashSet<i32>,
-    collected_columns: Vec<(ArrayRef, String, Type)>,
-}
-
-impl<'a> EqDelColumnProcessor<'a> {
-    fn new(equality_ids: &'a HashSet<i32>) -> Self {
-        Self {
-            equality_ids,
-            collected_columns: Vec::with_capacity(equality_ids.len()),
-        }
-    }
-
-    #[allow(clippy::type_complexity)]
-    fn finish(
-        self,
-    ) -> Result<
-        Vec<(
-            Box<dyn ExactSizeIterator<Item = Result<Option<Datum>>>>,
-            String,
-        )>,
-    > {
-        self.collected_columns
-            .into_iter()
-            .map(|(array, field_name, field_type)| {
-                let primitive_type = field_type
-                    .as_primitive_type()
-                    .ok_or_else(|| {
-                        Error::new(ErrorKind::Unexpected, "field is not a primitive type")
-                    })?
-                    .clone();
-
-                let lit_vec = arrow_primitive_to_literal(&array, &field_type)?;
-                let datum_iterator: Box<dyn ExactSizeIterator<Item = Result<Option<Datum>>>> =
-                    Box::new(lit_vec.into_iter().map(move |c| {
-                        c.map(|literal| {
-                            literal
-                                .as_primitive_literal()
-                                .map(|primitive_literal| {
-                                    Datum::new(primitive_type.clone(), primitive_literal)
-                                })
-                                .ok_or(Error::new(
-                                    ErrorKind::Unexpected,
-                                    "failed to convert to primitive literal",
-                                ))
-                        })
-                        .transpose()
-                    }));
-
-                Ok((datum_iterator, field_name))
-            })
-            .collect::<Result<Vec<_>>>()
-    }
-}
-
-impl SchemaWithPartnerVisitor<ArrayRef> for EqDelColumnProcessor<'_> {
-    type T = ();
-
-    fn schema(&mut self, _schema: &Schema, _partner: &ArrayRef, _value: ()) -> Result<()> {
-        Ok(())
-    }
-
-    fn field(&mut self, field: &NestedFieldRef, partner: &ArrayRef, _value: ()) -> Result<()> {
-        if self.equality_ids.contains(&field.id) && field.field_type.as_primitive_type().is_some() {
-            self.collected_columns.push((
-                partner.clone(),
-                field.name.clone(),
-                field.field_type.as_ref().clone(),
-            ));
-        }
-        Ok(())
-    }
-
-    fn r#struct(
-        &mut self,
-        _struct: &StructType,
-        _partner: &ArrayRef,
-        _results: Vec<()>,
-    ) -> Result<()> {
-        Ok(())
-    }
-
-    fn list(&mut self, _list: &ListType, _partner: &ArrayRef, _value: ()) -> Result<()> {
-        Ok(())
-    }
-
-    fn map(
-        &mut self,
-        _map: &MapType,
-        _partner: &ArrayRef,
-        _key_value: (),
-        _value: (),
-    ) -> Result<()> {
-        Ok(())
-    }
-
-    fn primitive(&mut self, _primitive: &PrimitiveType, _partner: &ArrayRef) -> Result<()> {
-        Ok(())
-    }
-}
-
-struct EqDelRecordBatchPartnerAccessor;
-
-impl PartnerAccessor<ArrayRef> for EqDelRecordBatchPartnerAccessor {
-    fn struct_partner<'a>(&self, schema_partner: &'a ArrayRef) -> Result<&'a ArrayRef> {
-        Ok(schema_partner)
-    }
-
-    fn field_partner<'a>(
-        &self,
-        struct_partner: &'a ArrayRef,
-        field: &NestedField,
-    ) -> Result<&'a ArrayRef> {
-        let Some(struct_array) = struct_partner.as_any().downcast_ref::<StructArray>() else {
-            return Err(Error::new(
-                ErrorKind::Unexpected,
-                "Expected struct array for field extraction",
-            ));
-        };
-
-        // Find the field by name within the struct
-        for (i, field_def) in struct_array.fields().iter().enumerate() {
-            if field_def.name() == &field.name {
-                return Ok(struct_array.column(i));
-            }
-        }
-
-        Err(Error::new(
-            ErrorKind::Unexpected,
-            format!("Field {} not found in parent struct", field.name),
-        ))
-    }
-
-    fn list_element_partner<'a>(&self, _list_partner: &'a ArrayRef) -> Result<&'a ArrayRef> {
-        Err(Error::new(
-            ErrorKind::FeatureUnsupported,
-            "List columns are unsupported in equality deletes",
-        ))
-    }
-
-    fn map_key_partner<'a>(&self, _map_partner: &'a ArrayRef) -> Result<&'a ArrayRef> {
-        Err(Error::new(
-            ErrorKind::FeatureUnsupported,
-            "Map columns are unsupported in equality deletes",
-        ))
-    }
-
-    fn map_value_partner<'a>(&self, _map_partner: &'a ArrayRef) -> Result<&'a ArrayRef> {
-        Err(Error::new(
-            ErrorKind::FeatureUnsupported,
-            "Map columns are unsupported in equality deletes",
-        ))
+        Ok(set)
     }
 }
 
@@ -645,7 +420,7 @@ mod tests {
             .await
             .expect("could not get batch stream");
 
-        let eq_ids = HashSet::from_iter(vec![2, 3, 4, 6, 8]);
+        let eq_ids = HashSet::from_iter(vec![2, 3, 4, 8]);
 
         let parsed_eq_delete = CachingDeleteFileLoader::parse_equality_deletes_record_batch_stream(
             record_batch_stream,
@@ -653,11 +428,40 @@ mod tests {
         )
         .await
         .expect("error parsing batch stream");
-        println!("{parsed_eq_delete}");
 
-        let expected = "(((((y != 1) OR (z != 100)) OR (a != \"HELP\")) OR (sa != 4)) OR (b != 62696E6172795F64617461)) AND (((((y != 2) OR (z IS NOT NULL)) OR (a IS NOT NULL)) OR (sa != 5)) OR (b IS NOT NULL))".to_string();
+        // One key for each of the file's two rows, the second with nulls in it.
+        assert_eq!(parsed_eq_delete.len(), 2);
+    }
 
-        assert_eq!(parsed_eq_delete.to_string(), expected);
+    #[tokio::test]
+    async fn test_delete_file_loader_refuses_a_nested_equality_column() {
+        let tmp_dir = TempDir::new().unwrap();
+        let table_location = tmp_dir.path().as_os_str().to_str().unwrap();
+        let file_io = FileIO::new_with_fs();
+
+        let eq_delete_file_path = setup_write_equality_delete_file_1(table_location);
+
+        let basic_delete_file_loader =
+            BasicDeleteFileLoader::new(file_io.clone(), ScanMetrics::new());
+        let record_batch_stream = basic_delete_file_loader
+            .parquet_to_batch_stream(
+                &eq_delete_file_path,
+                std::fs::metadata(&eq_delete_file_path).unwrap().len(),
+            )
+            .await
+            .expect("could not get batch stream");
+
+        // Field 6 is `s.sa`, inside a struct. The reader cannot address it in a
+        // data file's row filter, so loading says so instead of deleting on a
+        // partial key.
+        let err = CachingDeleteFileLoader::parse_equality_deletes_record_batch_stream(
+            record_batch_stream,
+            HashSet::from_iter(vec![2, 6]),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::FeatureUnsupported);
     }
 
     /// Create a simple field with metadata.
@@ -994,12 +798,10 @@ mod tests {
             .unwrap();
 
         // Verify both delete types can be processed together
-        let result = delete_filter
-            .build_equality_delete_predicate(&file_scan_task)
-            .await;
+        let result = delete_filter.equality_delete_sets(&file_scan_task).await;
         assert!(
             result.is_ok(),
-            "Failed to build equality delete predicate: {:?}",
+            "Failed to load the equality delete keys: {:?}",
             result.err()
         );
     }

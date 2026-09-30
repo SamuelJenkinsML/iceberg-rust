@@ -22,10 +22,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
-use arrow_array::{BooleanArray, RecordBatch};
-use arrow_schema::ArrowError;
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{ArrowPredicate, ArrowPredicateFn, RowSelection};
 use parquet::file::metadata::ParquetMetaData;
@@ -38,30 +35,6 @@ use crate::expr::visitors::bound_predicate_visitor::visit;
 use crate::expr::visitors::page_index_evaluator::PageIndexEvaluator;
 use crate::expr::visitors::row_group_metrics_evaluator::RowGroupMetricsEvaluator;
 use crate::spec::Schema;
-
-/// Counts the rows a row-filter stage is asked to judge.
-pub(super) struct CountingPredicate {
-    inner: Box<dyn ArrowPredicate>,
-    rows: Arc<AtomicU64>,
-}
-
-impl CountingPredicate {
-    pub(super) fn new(inner: Box<dyn ArrowPredicate>, rows: Arc<AtomicU64>) -> Self {
-        Self { inner, rows }
-    }
-}
-
-impl ArrowPredicate for CountingPredicate {
-    fn projection(&self) -> &ProjectionMask {
-        self.inner.projection()
-    }
-
-    fn evaluate(&mut self, batch: RecordBatch) -> std::result::Result<BooleanArray, ArrowError> {
-        self.rows
-            .fetch_add(batch.num_rows() as u64, Ordering::Relaxed);
-        self.inner.evaluate(batch)
-    }
-}
 
 impl ArrowReader {
     /// One stage of a `RowFilter`.
@@ -1330,30 +1303,54 @@ mod tests {
         )
     }
 
-    fn string_field(name: &str, id: i32) -> Field {
-        Field::new(name, DataType::Utf8, true).with_metadata(HashMap::from([(
-            PARQUET_FIELD_ID_META_KEY.to_string(),
-            id.to_string(),
-        )]))
+    /// A batch of nullable string columns, each `(name, field id, values)`.
+    fn strings(columns: Vec<(&str, i32, Vec<Option<&str>>)>) -> RecordBatch {
+        let fields: Vec<Field> = columns
+            .iter()
+            .map(|(name, id, _)| {
+                Field::new(*name, DataType::Utf8, true).with_metadata(HashMap::from([(
+                    PARQUET_FIELD_ID_META_KEY.to_string(),
+                    id.to_string(),
+                )]))
+            })
+            .collect();
+        let arrays = columns
+            .into_iter()
+            .map(|(_, _, values)| Arc::new(StringArray::from(values)) as ArrayRef)
+            .collect();
+        RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), arrays).unwrap()
     }
 
-    fn write_strings(path: &str, fields: Vec<Field>, columns: Vec<Vec<Option<&str>>>) {
-        let columns = columns
-            .into_iter()
-            .map(|c| Arc::new(StringArray::from(c)) as ArrayRef)
-            .collect();
-        let batch = RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), columns).unwrap();
+    fn eq_del_data() -> RecordBatch {
+        strings(vec![
+            ("entity_id", 1, EQ_DEL_ROWS.iter().map(|r| Some(r.0)).collect()),
+            ("ts", 2, EQ_DEL_ROWS.iter().map(|r| Some(r.1)).collect()),
+            ("v", 3, EQ_DEL_ROWS.iter().map(|r| Some(r.2)).collect()),
+        ])
+    }
+
+    /// Keys on `(entity_id, ts)`.
+    fn keys(deleted: Vec<(Option<&str>, Option<&str>)>) -> (Vec<i32>, RecordBatch) {
+        let batch = strings(vec![
+            ("entity_id", 1, deleted.iter().map(|k| k.0).collect()),
+            ("ts", 2, deleted.iter().map(|k| k.1).collect()),
+        ]);
+        (vec![1, 2], batch)
+    }
+
+    fn write_parquet(path: &str, batch: &RecordBatch) {
         let mut writer =
             ArrowWriter::try_new(File::create(path).unwrap(), batch.schema(), None).unwrap();
-        writer.write(&batch).unwrap();
+        writer.write(batch).unwrap();
         writer.close().unwrap();
     }
 
-    /// Reads `EQ_DEL_ROWS` under equality deletes on `(entity_id, ts)`.
-    /// Returns the `v` column of what is left, and how many rows were tested
-    /// against the deletes.
+    /// Reads one data file under equality delete files, each given as its
+    /// equality ids and its rows. Returns the `v` column of what is left, and
+    /// how many rows were tested against the deletes.
     async fn read_under_equality_deletes(
-        deleted_keys: Vec<(Option<&str>, Option<&str>)>,
+        data: RecordBatch,
+        delete_files: Vec<(Vec<i32>, RecordBatch)>,
         predicate: Option<Predicate>,
     ) -> (Vec<String>, u64) {
         let tmp_dir = TempDir::new().unwrap();
@@ -1361,36 +1358,23 @@ mod tests {
         let schema = eq_del_table_schema();
 
         let data_path = format!("{dir}/data.parquet");
-        write_strings(
-            &data_path,
-            vec![
-                string_field("entity_id", 1),
-                string_field("ts", 2),
-                string_field("v", 3),
-            ],
-            vec![
-                EQ_DEL_ROWS.iter().map(|r| Some(r.0)).collect(),
-                EQ_DEL_ROWS.iter().map(|r| Some(r.1)).collect(),
-                EQ_DEL_ROWS.iter().map(|r| Some(r.2)).collect(),
-            ],
-        );
-        let delete_path = format!("{dir}/eq-deletes.parquet");
-        write_strings(
-            &delete_path,
-            vec![string_field("entity_id", 1), string_field("ts", 2)],
-            vec![
-                deleted_keys.iter().map(|k| k.0).collect(),
-                deleted_keys.iter().map(|k| k.1).collect(),
-            ],
-        );
+        write_parquet(&data_path, &data);
 
-        let eq_del = FileScanTaskDeleteFile::builder()
-            .with_file_path(delete_path.clone())
-            .with_file_size_in_bytes(std::fs::metadata(&delete_path).unwrap().len())
-            .with_file_type(DataContentType::EqualityDeletes)
-            .with_partition_spec_id(0)
-            .with_equality_ids(Some(vec![1, 2]))
-            .build();
+        let deletes = delete_files
+            .into_iter()
+            .enumerate()
+            .map(|(n, (equality_ids, batch))| {
+                let path = format!("{dir}/eq-deletes-{n}.parquet");
+                write_parquet(&path, &batch);
+                FileScanTaskDeleteFile::builder()
+                    .with_file_size_in_bytes(std::fs::metadata(&path).unwrap().len())
+                    .with_file_path(path)
+                    .with_file_type(DataContentType::EqualityDeletes)
+                    .with_partition_spec_id(0)
+                    .with_equality_ids(Some(equality_ids))
+                    .build()
+            })
+            .collect();
         let task = FileScanTask::builder()
             .with_file_size_in_bytes(std::fs::metadata(&data_path).unwrap().len())
             .with_start(0)
@@ -1400,7 +1384,7 @@ mod tests {
             .with_schema(schema.clone())
             .with_project_field_ids(vec![3])
             .with_predicate(predicate.map(|p| p.bind(schema, true).unwrap()))
-            .with_deletes(vec![eq_del])
+            .with_deletes(deletes)
             .with_case_sensitive(true)
             .build();
 
@@ -1430,14 +1414,15 @@ mod tests {
     async fn equality_deletes_remove_matching_rows_from_a_filtered_read() {
         // Deletes for one row the scan selects, one it does not, and one key
         // the file does not hold.
-        let deleted = vec![
+        let deleted = keys(vec![
             (Some("e1"), Some("t2")),
             (Some("e2"), Some("t1")),
             (Some("e9"), Some("t9")),
-        ];
+        ]);
         let predicate = Reference::new("entity_id").equal_to(Datum::string("e1"));
 
-        let (left, checked) = read_under_equality_deletes(deleted, Some(predicate)).await;
+        let (left, checked) =
+            read_under_equality_deletes(eq_del_data(), vec![deleted], Some(predicate)).await;
 
         assert_eq!(left, vec!["v1", "v5"]);
         // Three of the five rows are e1. The other two never reach the deletes.
@@ -1446,11 +1431,120 @@ mod tests {
 
     #[tokio::test]
     async fn equality_deletes_remove_matching_rows_from_an_unfiltered_read() {
-        let deleted = vec![(Some("e1"), Some("t2")), (Some("e2"), Some("t1"))];
+        let deleted = keys(vec![(Some("e1"), Some("t2")), (Some("e2"), Some("t1"))]);
 
-        let (left, checked) = read_under_equality_deletes(deleted, None).await;
+        let (left, checked) = read_under_equality_deletes(eq_del_data(), vec![deleted], None).await;
 
         assert_eq!(left, vec!["v1", "v4", "v5"]);
         assert_eq!(checked, 5);
+    }
+
+    #[tokio::test]
+    async fn a_null_in_a_delete_key_matches_only_a_null_in_the_row() {
+        // Given rows whose ts is null for e1 and set for e2
+        let data = strings(vec![
+            ("entity_id", 1, vec![Some("e1"), Some("e1"), Some("e2")]),
+            ("ts", 2, vec![None, Some("t1"), Some("t1")]),
+            ("v", 3, vec![Some("v1"), Some("v2"), Some("v3")]),
+        ]);
+        // When the deletes name (e1, null) and (e2, t9)
+        let deleted = keys(vec![(Some("e1"), None), (Some("e2"), Some("t9"))]);
+
+        let (left, _) = read_under_equality_deletes(data, vec![deleted], None).await;
+
+        // Then only the row with the null goes
+        assert_eq!(left, vec!["v2", "v3"]);
+    }
+
+    #[tokio::test]
+    async fn a_row_with_a_null_key_column_survives_a_delete_of_a_set_value() {
+        let data = strings(vec![
+            ("entity_id", 1, vec![Some("e1"), Some("e1")]),
+            ("ts", 2, vec![None, Some("t1")]),
+            ("v", 3, vec![Some("v1"), Some("v2")]),
+        ]);
+        let deleted = keys(vec![(Some("e1"), Some("t1"))]);
+
+        let (left, _) = read_under_equality_deletes(data, vec![deleted], None).await;
+
+        assert_eq!(left, vec!["v1"]);
+    }
+
+    #[tokio::test]
+    async fn a_data_file_written_before_a_key_column_existed_reads_it_as_null() {
+        // Given a data file with no ts column at all
+        let data = strings(vec![
+            ("entity_id", 1, vec![Some("e1"), Some("e2")]),
+            ("v", 3, vec![Some("v1"), Some("v2")]),
+        ]);
+        // When the deletes name (e1, null) and (e2, t1)
+        let deleted = keys(vec![(Some("e1"), None), (Some("e2"), Some("t1"))]);
+
+        let (left, _) = read_under_equality_deletes(data, vec![deleted], None).await;
+
+        // Then e1 goes, because its missing ts is null, and e2 stays
+        assert_eq!(left, vec!["v2"]);
+    }
+
+    #[tokio::test]
+    async fn a_data_file_whose_key_column_has_another_arrow_type_still_matches() {
+        // Given a data file that stores ts as LargeUtf8
+        let utf8 = eq_del_data();
+        let fields: Vec<Field> = utf8
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| match f.name().as_str() {
+                "ts" => f.as_ref().clone().with_data_type(DataType::LargeUtf8),
+                _ => f.as_ref().clone(),
+            })
+            .collect();
+        let ts = Arc::new(LargeStringArray::from(
+            EQ_DEL_ROWS.iter().map(|r| Some(r.1)).collect::<Vec<_>>(),
+        )) as ArrayRef;
+        let data = RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), vec![
+            Arc::clone(utf8.column(0)),
+            ts,
+            Arc::clone(utf8.column(2)),
+        ])
+        .unwrap();
+        let deleted = keys(vec![(Some("e1"), Some("t2"))]);
+
+        let (left, _) = read_under_equality_deletes(data, vec![deleted], None).await;
+
+        assert_eq!(left, vec!["v1", "v3", "v4", "v5"]);
+    }
+
+    #[tokio::test]
+    async fn delete_files_with_different_equality_ids_both_apply() {
+        // One file deletes on (entity_id, ts), the other on entity_id alone
+        let by_key = keys(vec![(Some("e1"), Some("t2"))]);
+        let by_entity = (vec![1], strings(vec![("entity_id", 1, vec![Some("e2")])]));
+
+        let (left, _) =
+            read_under_equality_deletes(eq_del_data(), vec![by_key, by_entity], None).await;
+
+        assert_eq!(left, vec!["v1", "v5"]);
+    }
+
+    #[tokio::test]
+    async fn many_delete_files_with_many_keys_delete_only_what_they_name() {
+        // 20 files of 2,000 keys each, none of which the data file holds,
+        // and one file that names a real row
+        let mut delete_files: Vec<(Vec<i32>, RecordBatch)> = (0..20)
+            .map(|file| {
+                let ids: Vec<String> = (0..2000).map(|n| format!("x{file}_{n}")).collect();
+                let batch = strings(vec![
+                    ("entity_id", 1, ids.iter().map(|id| Some(id.as_str())).collect()),
+                    ("ts", 2, vec![Some("t1"); 2000]),
+                ]);
+                (vec![1, 2], batch)
+            })
+            .collect();
+        delete_files.push(keys(vec![(Some("e2"), Some("t2"))]));
+
+        let (left, _) = read_under_equality_deletes(eq_del_data(), delete_files, None).await;
+
+        assert_eq!(left, vec!["v1", "v2", "v3", "v5"]);
     }
 }
